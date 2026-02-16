@@ -1,0 +1,305 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: data-analytics-pipeline-
+  labels:
+    project: analytics
+    team: self-serve
+
+spec:
+  entrypoint: analytics-dag
+  onExit: exit-handler-wrapper
+
+  templates:
+  # MAIN DAG FLOW
+  - name: analytics-dag
+    dag:
+      tasks:
+
+      - name: generate-csv
+        template: generate-csv
+
+      - name: split-csv
+        template: split-csv
+        dependencies: [generate-csv]
+        arguments:
+          artifacts:
+          - name: input
+            from: "{{tasks.generate-csv.outputs.artifacts.raw-csv}}"
+
+      - name: validate-chunk-1
+        template: validate-single-chunk
+        dependencies: [split-csv]
+        arguments:
+          artifacts:
+          - name: chunk
+            from: "{{tasks.split-csv.outputs.artifacts.chunk-1}}"
+
+      - name: validate-chunk-2
+        template: validate-single-chunk
+        dependencies: [split-csv]
+        arguments:
+          artifacts:
+          - name: chunk
+            from: "{{tasks.split-csv.outputs.artifacts.chunk-2}}"
+
+      - name: validate-chunk-3
+        template: validate-single-chunk
+        dependencies: [split-csv]
+        arguments:
+          artifacts:
+          - name: chunk
+            from: "{{tasks.split-csv.outputs.artifacts.chunk-3}}"
+
+      - name: validate-chunk-4
+        template: validate-single-chunk
+        dependencies: [split-csv]
+        arguments:
+          artifacts:
+          - name: chunk
+            from: "{{tasks.split-csv.outputs.artifacts.chunk-4}}"
+
+      - name: validate-chunk-5
+        template: validate-single-chunk
+        dependencies: [split-csv]
+        arguments:
+          artifacts:
+          - name: chunk
+            from: "{{tasks.split-csv.outputs.artifacts.chunk-5}}"
+
+      - name: merge-chunks
+        template: merge-chunks
+        dependencies:
+          - validate-chunk-1
+          - validate-chunk-2
+          - validate-chunk-3
+          - validate-chunk-4
+          - validate-chunk-5
+        arguments:
+          artifacts:
+          - name: c1
+            from: "{{tasks.split-csv.outputs.artifacts.chunk-1}}"
+          - name: c2
+            from: "{{tasks.split-csv.outputs.artifacts.chunk-2}}"
+          - name: c3
+            from: "{{tasks.split-csv.outputs.artifacts.chunk-3}}"
+          - name: c4
+            from: "{{tasks.split-csv.outputs.artifacts.chunk-4}}"
+          - name: c5
+            from: "{{tasks.split-csv.outputs.artifacts.chunk-5}}"
+
+      - name: clean-data
+        template: clean-data
+        dependencies: [merge-chunks]
+        arguments:
+          artifacts:
+          - name: merged
+            from: "{{tasks.merge-chunks.outputs.artifacts.merged-data}}"
+
+      - name: analytics-engine
+        template: analytics-engine
+        dependencies: [clean-data]
+        arguments:
+          artifacts:
+          - name: cleaned
+            from: "{{tasks.clean-data.outputs.artifacts.cleaned-data}}"
+
+  # DATA GENERATOR
+  - name: generate-csv
+    script:
+      image: myrepo/python-pandas:3.9
+      command: ["python"]
+      source: |
+        import csv, random
+        from datetime import datetime, timedelta
+
+        regions = ["IN","US","EU","APAC"]
+        products = ["Phone","Laptop","Headphones","Tablet","Monitor"]
+        payment_modes = ["Card","UPI","Wallet"]
+        statuses = ["success","failed"]
+
+        start_time = datetime(2026,1,1,9,0,0)
+        rows=[]
+        order_id=1000
+
+        for i in range(50000):
+            order_id+=1
+            user_id=random.randint(1000,9000)
+            region=random.choice(regions)
+            product=random.choice(products)
+            quantity=random.randint(1,5)
+            price=random.randint(500,90000)
+
+            if random.random()<0.02:
+                price=-price
+
+            total_amount=quantity*price
+
+            if random.random()<0.02:
+                total_amount+=random.randint(1,1000)
+
+            payment=random.choice(payment_modes)
+            status=random.choice(statuses)
+            timestamp=start_time+timedelta(minutes=i)
+
+            rows.append([
+                order_id,user_id,region,product,
+                quantity,price,total_amount,
+                payment,status,timestamp.strftime("%Y-%m-%d %H:%M:%S")
+            ])
+
+        with open("/tmp/sales_data.csv","w",newline="") as f:
+            writer=csv.writer(f)
+            writer.writerow([
+              "order_id","user_id","region","product",
+              "quantity","price","total_amount",
+              "payment_mode","status","timestamp"
+            ])
+            writer.writerows(rows)
+    outputs:
+      artifacts:
+      - name: raw-csv
+        path: /tmp/sales_data.csv
+
+  # SPLIT CSV
+  - name: split-csv
+    inputs:
+      artifacts:
+      - name: input
+        path: /tmp/sales_data.csv
+    script:
+      image: myrepo/python-pandas:3.9
+      command: ["python"]
+      source: |
+        import pandas as pd
+        df = pd.read_csv("/tmp/sales_data.csv")
+        chunk_size = int(len(df)/5)
+
+        for i in range(5):
+            start = i*chunk_size
+            end = None if i==4 else (i+1)*chunk_size
+            df.iloc[start:end].to_csv(f"/tmp/chunk_{i+1}.csv", index=False)
+    outputs:
+      artifacts:
+      - name: chunk-1
+        path: /tmp/chunk_1.csv
+      - name: chunk-2
+        path: /tmp/chunk_2.csv
+      - name: chunk-3
+        path: /tmp/chunk_3.csv
+      - name: chunk-4
+        path: /tmp/chunk_4.csv
+      - name: chunk-5
+        path: /tmp/chunk_5.csv
+
+  # VALIDATION
+  - name: validate-single-chunk
+    inputs:
+      artifacts:
+      - name: chunk
+        path: /tmp/chunk.csv
+    retryStrategy:
+      limit: 3
+      backoff:
+        duration: "10s"
+        factor: 2
+    script:
+      image: myrepo/python-pandas:3.9
+      command: ["python"]
+      source: |
+        import pandas as pd, json
+        df = pd.read_csv("/tmp/chunk.csv")
+        invalid=[]
+        for i,r in df.iterrows():
+            errs=[]
+            if r["total_amount"]!=r["quantity"]*r["price"]: errs.append("amount")
+            if r["price"]<=0: errs.append("price")
+            if r["quantity"]<=0: errs.append("qty")
+            if errs: invalid.append({"row":i,"errors":errs})
+
+        with open("/tmp/validation.json","w") as f:
+            json.dump({"invalid":len(invalid)},f)
+    outputs:
+      artifacts:
+      - name: validation-result
+        path: /tmp/validation.json
+
+  # MERGE
+  - name: merge-chunks
+    inputs:
+      artifacts:
+      - name: c1
+        path: /tmp/c1.csv
+      - name: c2
+        path: /tmp/c2.csv
+      - name: c3
+        path: /tmp/c3.csv
+      - name: c4
+        path: /tmp/c4.csv
+      - name: c5
+        path: /tmp/c5.csv
+    script:
+      image: myrepo/python-pandas:3.9
+      command: ["python"]
+      source: |
+        import pandas as pd
+        dfs=[pd.read_csv(f) for f in ["/tmp/c1.csv","/tmp/c2.csv","/tmp/c3.csv","/tmp/c4.csv","/tmp/c5.csv"]]
+        pd.concat(dfs).to_csv("/tmp/merged.csv",index=False)
+    outputs:
+      artifacts:
+      - name: merged-data
+        path: /tmp/merged.csv
+
+  # CLEAN
+  - name: clean-data
+    inputs:
+      artifacts:
+      - name: merged
+        path: /tmp/merged.csv
+    script:
+      image: myrepo/python-pandas:3.9
+      command: ["python"]
+      source: |
+        import pandas as pd
+        df=pd.read_csv("/tmp/merged.csv")
+        df=df[(df["total_amount"]==df["quantity"]*df["price"]) & (df["price"]>0) & (df["quantity"]>0) & (df["status"]=="success")]
+        df.to_csv("/tmp/cleaned_data.csv",index=False)
+    outputs:
+      artifacts:
+      - name: cleaned-data
+        path: /tmp/cleaned_data.csv
+
+  # ANALYTICS
+  - name: analytics-engine
+    inputs:
+      artifacts:
+      - name: cleaned
+        path: /tmp/cleaned_data.csv
+    script:
+      image: myrepo/python-pandas:3.9
+      command: ["python"]
+      source: |
+        import pandas as pd, json
+        df=pd.read_csv("/tmp/cleaned_data.csv")
+        report={
+          "orders":int(len(df)),
+          "revenue":float(df["total_amount"].sum())
+        }
+        with open("/tmp/analytics_report.json","w") as f:
+            json.dump(report,f,indent=2)
+    outputs:
+      artifacts:
+      - name: analytics-report
+        path: /tmp/analytics_report.json
+
+  # EXIT HANDLER
+  - name: exit-handler-wrapper
+    steps:
+    - - name: cleanup
+        template: cleanup
+
+  - name: cleanup
+    container:
+      image: alpine:latest
+      command: [sh, -c]
+      args: ["echo Cleanup complete"]
